@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Global Supply Chains of UK Electronics Listed Companies</title>
+<style>
+  html, body { margin: 0; height: 100%; width: 100%; overflow: hidden; background: #000; }
+  #globeViz { display: block; width: 100%; height: 100%; }
+  .customer-square { width: 8px; height: 8px; background: lime; transform: translate(-50%,-50%); }
+  .firm-triangle { width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-bottom:10px solid yellow; transform: translate(-50%,0); }
+  .globe-tooltip { background:#333; color:#fff; padding:5px 10px; border-radius:3px; font-size:12px; line-height:1.5; max-width:300px; pointer-events:none; }
+  .globe-tooltip strong { color:orange; }
+  #legend { position:absolute; bottom:20px; left:20px; background:rgba(20,20,20,0.85); color:#fff; padding:10px 15px; border-radius:6px; font-size:13px; line-height:1.5; max-width:240px; font-family: sans-serif; }
+  #legend h4 { margin:0 0 6px 0; font-size:14px; color:#FFA500; }
+  .legend-line { display:flex; align-items:center; margin-bottom:4px; }
+  .line-sample { width:40px; background:cyan; margin-right:8px; }
+  .line-sample.thin{height:1px;} .line-sample.medium{height:2px;} .line-sample.thick{height:3px;}
+  .polygon-sample { display:inline-block; width:15px; height:15px; background:rgba(104,250,250,0.9); margin-right:6px; vertical-align:middle; }
+  #status { position:absolute; top:10px; left:10px; color:#fff; background:rgba(0,0,0,0.6); padding:6px 10px; border-radius:4px; font-family:sans-serif; font-size:12px; max-width: 70%; }
+</style>
+</head>
+<body>
+
+<div id="globeViz"></div>
+<div id="status">Loading globe.gl…</div>
+
+<div id="legend">
+  <h4>Legend</h4>
+  <div class="legend-line"><div class="line-sample thin"></div><span>Short-term contract</span></div>
+  <div class="legend-line"><div class="line-sample medium"></div><span>Medium-term contract</span></div>
+  <div class="legend-line"><div class="line-sample thick"></div><span>Long-term contract</span></div>
+  <div class="legend-line"><div class="polygon-sample"></div><span>Geopolitical events (since 2000s)</span></div>
+</div>
+
+<!--
+  Why these scripts and not the previous ones:
+  - DO NOT load three.js separately. globe.gl bundles its own three / three-globe; loading a
+    mismatched three first is what produced "Globe is not defined" — the script aborted on init.
+  - jsdelivr is the CDN the official globe.gl docs recommend.
+-->
+<script src="https://cdn.jsdelivr.net/npm/globe.gl@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-dsv@3"></script>
+
+<script>
+const status = document.getElementById('status');
+const setStatus = (msg) => { status.textContent = msg; };
+
+if (typeof Globe === 'undefined') {
+  setStatus('Failed: globe.gl did not load. Check network/CSP.');
+  throw new Error('globe.gl not loaded');
+}
+
+const relatedCountries = new Set([
+  'Russia','Israel','Lebanon','Saudi Arabia','Yemen','Colombia','Afghanistan',
+  'Bahrain','Qatar','Somalia','United States of America','Timor-Leste',
+  'United Kingdom','Serbia','Montenegro','Iraq','France','Turkey','Denmark',
+  'Canada','Azerbaijan','Armenia','Kazakhstan','Ukraine','Finland','Syria',
+  'Niger','Gabon','Sweden','Haiti','Sudan','Burkina Faso','Mali','Taiwan',
+  'North Korea','South Korea','Iran','India','Mexico','El Salvador','Guatemala',
+  'Honduras','Venezuela','Dem. Rep. Congo','Myanmar','China'
+]);
+
+const OPACITY = 0.55;
+const MIN_STROKE = 0.4, MAX_STROKE = 2.5;
+const MAX_FINITE_DURATION = 50, MAX_DURATION_FOR_MAPPING = 100;
+const ONGOING_DATE_STRING = "4000", ONGOING_YEAR_SENTINEL = 5000;
+
+const cleanNum = v => (v != null && v !== '' && !isNaN(parseFloat(v))) ? parseFloat(v) : null;
+const safeName = v => (v && String(v).trim()) ? v : "N/A";
+const safeDate = v => String(v||"").trim() || "N/A";
+const isOngoingDate = d => String(d||"").includes(ONGOING_DATE_STRING);
+const yearOf = d => {
+  const s = String(d||"").trim().toLowerCase();
+  if (s.includes(ONGOING_DATE_STRING)) return ONGOING_YEAR_SENTINEL;
+  const m = s.match(/(\d{4})$/);
+  return m ? parseInt(m[1]) : null;
+};
+const duration = (a,b) => {
+  const s = yearOf(a), e = yearOf(b);
+  if (!s || !e || s > e) return 0;
+  return e === ONGOING_YEAR_SENTINEL ? MAX_DURATION_FOR_MAPPING : e - s;
+};
+const stroke = d => {
+  if (d >= MAX_DURATION_FOR_MAPPING) return MAX_STROKE;
+  const r = Math.min(d, MAX_FINITE_DURATION) / MAX_FINITE_DURATION;
+  return MIN_STROKE + r * (MAX_STROKE - MIN_STROKE);
+};
+
+let hoveredPolygon = null;
+
+// Modern globe.gl uses `new Globe(element)`. The old `Globe()(element)` factory was removed.
+const myGlobe = new Globe(document.getElementById('globeViz'))
+  .width(window.innerWidth).height(window.innerHeight)
+  .globeImageUrl('//cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg')
+  .bumpImageUrl('//cdn.jsdelivr.net/npm/three-globe/example/img/earth-topology.png')
+  .backgroundImageUrl('//cdn.jsdelivr.net/npm/three-globe/example/img/night-sky.png')
+  .pointOfView({ lat: 20, lng: 0, altitude: 2.2 })
+  .arcStartLat(d=>d.srcLat).arcStartLng(d=>d.srcLng)
+  .arcEndLat(d=>d.dstLat).arcEndLng(d=>d.dstLng)
+  .arcDashLength(0.4).arcDashGap(1).arcDashInitialGap(()=>Math.random())
+  .arcDashAnimateTime(4000).arcsTransitionDuration(0)
+  .arcStroke(d=>d.arcStroke).arcColor(d=>d.color)
+  .arcLabel(d=>{
+    const endDate = isOngoingDate(d.endDate) ? "Ongoing" : safeDate(d.endDate);
+    const partner = d.connectionType === 'FirmToSupplier' ? d.supplierName : d.customerName;
+    const partnerLabel = d.connectionType === 'FirmToSupplier' ? 'Supplier' : 'Customer';
+    return `<div class="globe-tooltip">
+      <strong>Focal Firm:</strong> ${safeName(d.firmName)}<br>
+      <strong>${partnerLabel}:</strong> ${safeName(partner)}<br>
+      <strong>Duration:</strong> ${safeDate(d.startDate)} – ${endDate}
+    </div>`;
+  })
+  .pointLat(d=>d.lat).pointLng(d=>d.lng)
+  .pointAltitude(0.01).pointRadius(0.5)
+  .pointColor(d => d.type==='Supplier' ? 'red' : d.type==='Customer' ? 'lime' : 'yellow')
+  .htmlLat(d=>d.lat).htmlLng(d=>d.lng).htmlAltitude(0.1)
+  .htmlElement(d => {
+    const el = document.createElement('div');
+    el.className = d.type==='Customer' ? 'customer-square' : 'firm-triangle';
+    return el;
+  });
+
+setStatus('Globe initialised. Loading data…');
+window.addEventListener('resize', () => myGlobe.width(window.innerWidth).height(window.innerHeight));
+
+// Country polygons
+if (typeof topojson !== 'undefined') {
+  fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json')
+    .then(r => r.json())
+    .then(world => {
+      const countries = topojson.feature(world, world.objects.countries).features;
+      myGlobe.polygonsData(countries)
+        .polygonAltitude(d => d === hoveredPolygon ? 0.05 : 0.01)
+        .polygonCapColor(d => {
+          const related = relatedCountries.has((d.properties.name||'').trim());
+          if (d === hoveredPolygon) return related ? 'rgba(104,250,250,0.9)' : 'rgba(255,255,212,0.9)';
+          return related ? 'rgba(104,194,191,0.7)' : 'rgba(80,80,80,0.4)';
+        })
+        .polygonSideColor(() => 'rgba(0,0,0,0)')
+        .polygonStrokeColor(() => '#252525')
+        .polygonLabel(d => `<div class="globe-tooltip"><b>${d.properties.name}</b></div>`)
+        .onPolygonHover(p => {
+          hoveredPolygon = p;
+          myGlobe
+            .polygonAltitude(d => d === hoveredPolygon ? 0.05 : 0.01)
+            .polygonCapColor(d => {
+              const related = relatedCountries.has((d.properties.name||'').trim());
+              if (d === hoveredPolygon) return related ? 'rgba(104,250,250,0.9)' : 'rgba(255,255,212,0.9)';
+              return related ? 'rgba(104,194,191,0.7)' : 'rgba(80,80,80,0.4)';
+            });
+        });
+    })
+    .catch(err => { console.error(err); setStatus('Country borders failed: ' + err.message); });
+}
+
+// Supply-chain data
+const DEMO_CSV = `CompanynameLatinalphabet,Latitude_new,Longitude_new,SOURCE_name_sup,SOURCE_latitude,SOURCE_longitude,start_sup,end_sup,TARGET_name_cus,TARGET_latitude,TARGET_longitude,start_cus,end_cus
+ARM Holdings,52.2053,0.1218,TSMC,24.7736,120.9974,2010,4000,Apple,37.3349,-122.0090,2008,4000
+Dialog Semi,51.5074,-0.1278,Samsung Foundry,37.5665,126.9780,2015,2022,Bosch,48.7758,9.1829,2012,4000
+Imagination Tech,51.4065,-0.5950,GlobalFoundries,42.8864,-78.8784,2014,2020,MediaTek,24.7736,120.9974,2016,4000
+Spirent Comms,51.4663,-0.4774,Foxconn,25.0801,121.5644,2011,4000,Verizon,40.7128,-74.0060,2009,4000
+Renishaw,52.0833,-2.1833,Murata,34.6937,135.5023,2013,4000,Siemens,48.1351,11.5820,2010,4000`;
+
+function processCsv(text) {
+  if (typeof d3 === 'undefined') { setStatus('d3-dsv missing — cannot parse CSV'); return; }
+  const data = d3.csvParse(text);
+  const suppliers=[], firms=[], customers=[], links=[];
+  data.forEach(r => {
+    const fLat=cleanNum(r.Latitude_new), fLng=cleanNum(r.Longitude_new);
+    const sLat=cleanNum(r.SOURCE_latitude), sLng=cleanNum(r.SOURCE_longitude);
+    const cLat=cleanNum(r.TARGET_latitude), cLng=cleanNum(r.TARGET_longitude);
+    if (sLat && sLng) suppliers.push({type:'Supplier', lat:sLat, lng:sLng});
+    if (fLat && fLng) firms.push({type:'Firm', lat:fLat, lng:fLng});
+    if (cLat && cLng) customers.push({type:'Customer', lat:cLat, lng:cLng});
+
+    const d1 = duration(r.start_sup, r.end_sup), d2 = duration(r.start_cus, r.end_cus);
+    if (fLat&&fLng&&sLat&&sLng) links.push({
+      srcLat:fLat, srcLng:fLng, dstLat:sLat, dstLng:sLng,
+      color:`rgba(255,80,80,${OPACITY})`, connectionType:'FirmToSupplier',
+      firmName:r.CompanynameLatinalphabet, supplierName:r.SOURCE_name_sup,
+      startDate:r.start_sup, endDate:r.end_sup, arcStroke:stroke(d1)
+    });
+    if (fLat&&fLng&&cLat&&cLng) links.push({
+      srcLat:fLat, srcLng:fLng, dstLat:cLat, dstLng:cLng,
+      color:`rgba(80,255,80,${OPACITY})`, connectionType:'FirmToCustomer',
+      firmName:r.CompanynameLatinalphabet, customerName:r.TARGET_name_cus,
+      startDate:r.start_cus, endDate:r.end_cus, arcStroke:stroke(d2)
+    });
+  });
+  myGlobe.pointsData(suppliers)
+         .htmlElementsData([...firms, ...customers])
+         .arcsData(links);
+  setStatus(`Loaded ${data.length} rows · ${links.length} arcs`);
+}
+
+fetch('all_firms_combined.csv')
+  .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+  .then(processCsv)
+  .catch(err => {
+    console.warn('CSV load failed, using demo data:', err);
+    setStatus('CSV not found (' + err.message + ') — showing demo data');
+    processCsv(DEMO_CSV);
+  });
+</script>
+</body>
+</html>
